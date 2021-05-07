@@ -1,0 +1,337 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Objetive: Get read counts for promoters from ATACseq data at 24 weeks and read counts from RNAseq, classify them and computing GO analysis.
+Pipeline described in https://epigeneticsandchromatin.biomedcentral.com/articles/10.1186/s13072-019-0260-2#Sec10
+
+Promoters are going to be defined as 500 bp up or downstream a TSS. In 'generate_TSS.R', a 100 bp ranging TSS bed file was created. The output, 'Nfu_20150522.genes_20150922.TSS.sorted.bed', can be used extending 450 bp both up and downstream each genomic range.
+
+```{bash}
+cd ~/nfur/genome
+awk -v s=450 '{print $1, $2-s, $3+s, $4, $5}' OFS='\t' Nfu_20150522.genes_20150922.TSS.sorted.bed > Nfu_20150522.genes_20150922.TSS.sorted_500bp.bed.tmp
+
+# Remove negative positions
+awk -vOFS='\t' '{for(i=1;i<=NF;i++)if($i<0)$i=0}1' Nfu_20150522.genes_20150922.TSS.sorted_500bp.bed.tmp > Nfu_20150522.genes_20150922.TSS.sorted_500bp.bed.tmp1
+
+# Adjust off chromosome positions
+chrom_info=Nfu_20150522.softmasked_genome_chromInfo.txt
+bedtools slop -i Nfu_20150522.genes_20150922.TSS.sorted_500bp.bed.tmp1 -g ${chrom_info} -b 0 > Nfu_20150522.genes_20150922.TSS.sorted_500bp.bed
+
+rm *tmp*
+```
+
+
+Peaks conserved across replicates at 24 weeks are going to be used. They are found in '~/nfur/ATACseq/nucfree/24sem_{tissue}/TRACKS/24sem_{tissue}_idrConsPeaks.bed'. Intersection between these regions and 500 bp extended TSS are the regions of interest. Next, reads mapped at '~/nfur/ATACseq/nucfree/24sem_{tissue}/N-fur_ATAC_24sem_{tissue}{rep}_nucfree.bed' will be intersected with regions of interest to provide the counts for regions of interest. 
+
+```{bash}
+tissue=HB
+week=8
+
+idr_file=~/nfur/ATACseq/nucfree/${week}sem_${tissue}/TRACKS/${week}sem_${tissue}_idrConsPeaks.bed
+tss=~/nfur/genome/Nfu_20150522.genes_20150922.TSS.sorted_500bp.bed
+int1=~/nfur/intersection_atac_rna/${tissue}_tss_idr.bed
+folder=~/nfur/intersection_atac_rna/
+
+cut -f1,2,3 ${idr_file} | sort -k1,1 -k2n > ${idr_file}.sorted
+intersectBed -a $tss -b ${idr_file}.sorted -wa > ${int1}.tmp
+mergeBed -i ${int1}.tmp > $int1
+
+rm ${idr_file}.sorted
+rm ${int1}.tmp
+
+for file in ~/nfur/ATACseq/nucfree/${week}sem_${tissue}/*;
+do
+	if [[ $file == *nucfree.bed ]];
+	then 
+		echo $file
+		cut -f1,2,3 $file | sort -k1,1 -k2n > ${file}.sorted
+		intersectBed -a $int1 \
+			     -b ${file}.sorted -c -wa -sorted\
+			     > ${file}.counts
+		
+		mv ${file}.counts $folder
+		rm ${file}.sorted
+	fi; 
+done
+
+```
+
+I changed the names from 'N-fur_ATAC_24sem_FB1_nucfree.bed.tmp' to 'FB1_tss_idr.counts' (and equivalents). Then, genes from tss file was added. To that end, coordenates was 1 column formatted (chr:start-end).
+
+```{bash}
+
+cd ~/nfur/intersection_atac_rna/
+
+for file in ./*;
+  do
+  if [[ $file == *N-fur* ]];
+    then
+    
+    tissue=$(echo $file | cut -d"_" -f4)
+    new_filename=${tissue}_tss_idr.counts
+    echo $new_filename
+    mv $file $new_filename
+    fi;
+done
+
+```
+
+
+```{bash}
+cd ~/nfur/intersection_atac_rna/
+
+for file in ./*;
+  do
+	if [[ $file == *counts ]];
+	then
+    awk -v OFS='\t' '{$1=$1":"$2"-"$3; $2=$4; $3=""; $4=""}1' $file > ${file}.tmp
+  fi;
+done
+
+cut -f1,2,3,5 ~/nfur/genome/Nfu_20150522.genes_20150922.TSS.sorted_500bp.bed | awk -v OFS='\t' '{$1=$1":"$2"-"$3; $2=$4; $3=""; $4=""}1' > tss.tmp
+
+join -j 1 -o 1.1,1.2,2.2 <(sort -k1,1 -k2n FB1_tss_idr.counts.tmp) <(sort -k1,1 -k2n FB2_tss_idr.counts.tmp) | join -j 1 -o 1.1,2.2,1.2,1.3 - <(sort -k1,1 -k2n tss.tmp) > FB_promoter_atac.counts
+join -j 1 -o 1.1,1.2,2.2 <(sort -k1,1 -k2n MB1_tss_idr.counts.tmp) <(sort -k1,1 -k2n MB2_tss_idr.counts.tmp) | join -j 1 -o 1.1,2.2,1.2,1.3 - <(sort -k1,1 -k2n tss.tmp) > MB_promoter_atac.counts
+join -j 1 -o 1.1,1.2,2.2 <(sort -k1,1 -k2n HB1_tss_idr.counts.tmp) <(sort -k1,1 -k2n HB2_tss_idr.counts.tmp) | join -j 1 -o 1.1,2.2,1.2,1.3 - <(sort -k1,1 -k2n tss.tmp) > HB_promoter_atac.counts
+
+rm *tmp # comment to see intermediate files
+rm *tss_idr*
+```
+
+
+Next, we can read atacseq counts from promoters and rnaseq data. Normalization and log2 has to take place to avoid library size effect and scale issues. In addition to this, TPM are computed for RNAseq data.
+
+```{r}
+
+## ATACseq data
+atac_counts_files <- list.files("/home/areyes/nfur/intersection_atac_rna", pattern = "count", full.names = T)
+atac_counts_files
+
+atac_counts <- lapply(atac_counts_files, function(x) read.table(x))
+names(atac_counts) <- c("FB", "HB", "MB")
+
+library(limma)
+atac_counts_norm <- lapply(atac_counts, function(x) normalizeQuantiles(x[,c(3,4)]))
+lapply(atac_counts_norm, summary)
+
+atac_counts_log <- lapply(atac_counts_norm, function(x) log2(x+1))
+
+atac_counts_mean <- lapply(atac_counts_log, rowMeans)
+
+atac_counts_FB <- data.frame(genes=atac_counts$FB[,2], counts=atac_counts_mean$FB)
+atac_counts_MB <- data.frame(genes=atac_counts$MB[,2], counts=atac_counts_mean$MB)
+atac_counts_HB <- data.frame(genes=atac_counts$HB[,2], counts=atac_counts_mean$HB)
+
+## RNAseq data
+rna_counts_files <- list.files("/home/areyes/nfur/RNAseq/counts", pattern = "tab", full.names = T)
+rna_counts_files
+
+rna_counts <- lapply(rna_counts_files, function(x) read.table(x)[,c(9,10)])
+names(rna_counts) <- c("FB", "HB", "MB")
+
+rna_counts_filtered <- lapply(rna_counts, function(x) {x[-grep('__', rownames(x)),]}) # remove star annotations
+
+compute_tpm <- function(count){
+
+  # Read gene length
+  gene_length <- read.table("/home/areyes/nfur/genome/Nfu_genelengths.tab", header = T)[,c(1,2)]
+  gene_length <- gene_length[order(gene_length$gene),]
+  gene_length <- gene_length[gene_length[,1] %in% rownames(count),]
+  diff <- rownames(count)[!rownames(count) %in% gene_length[,1]]
+  count <- count[!rownames(count) %in% diff,]
+  
+  # TPM (based on https://support.bioconductor.org/p/91218/)
+  x <- count / gene_length[,2]
+  tpm <- t( t(x) * 1e6 / colSums(x) )
+  tpm
+}
+
+rna_counts_TPM <- lapply(rna_counts_filtered, compute_tpm)
+
+rna_counts_norm <- lapply(rna_counts_TPM, normalizeQuantiles)
+
+rna_counts_log <- lapply(rna_counts_norm, function(x) log2(x+1))
+
+rna_counts_mean <- lapply(rna_counts_log, rowMeans)
+
+rna_counts_FB <- data.frame(genes=rownames(rna_counts_filtered$FB), counts=rna_counts_mean$FB, row.names = NULL)
+rna_counts_MB <- data.frame(genes=rownames(rna_counts_filtered$MB), counts=rna_counts_mean$MB, row.names = NULL)
+rna_counts_HB <- data.frame(genes=rownames(rna_counts_filtered$HB), counts=rna_counts_mean$HB, row.names = NULL)
+
+```
+
+
+Before analysis, the intersection between genes whose promoters have atac peaks and genes from rnaseq needs to be done. A left join intersection is performed, we keep all atac promoter genes and add zeros to the expression measure.
+
+```{r}
+FB_counts <- merge(x = atac_counts_FB, y = rna_counts_FB, by = "genes", all.x = TRUE)
+FB_counts[is.na(FB_counts)] <- 0
+
+MB_counts <- merge(x = atac_counts_MB, y = rna_counts_MB, by = "genes", all.x = TRUE)
+MB_counts[is.na(MB_counts)] <- 0
+
+HB_counts <- merge(x = atac_counts_HB, y = rna_counts_HB, by = "genes", all.x = TRUE)
+HB_counts[is.na(HB_counts)] <- 0
+```
+
+
+
+Plot results and compute GO analysis.
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
+
+tissue_counts <- FB_counts
+filename <- "/home/areyes/nfur/intersection_atac_rna/FB" # change only the tissue
+
+if(unlist(strsplit(filename, "/"))[6] == "HB") title <- "Hind brain"
+if(unlist(strsplit(filename, "/"))[6] == "FB") title <- "Fore brain"
+if(unlist(strsplit(filename, "/"))[6] == "MB") title <- "Mid brain"
+
+# R square
+rsq <- function (x, y) cor(x, y) ^ 2
+r2 <- round(rsq( tissue_counts$counts.x,  tissue_counts$counts.y), 2)
+cat(r2) # copy this number manually in annotate element from next plot
+
+# Plot correlation
+ggplot( tissue_counts, aes(x=counts.x, y=counts.y)) + 
+  geom_point() +
+  geom_smooth(method=lm, color="red", se = F)+
+  labs(title=paste(title, " (week 24) correlation"),
+       x=expression("ATAC-seq accesibility [log"[2]*"]"), y = expression("RNA-seq expression [log"[2]* "(TPM)]")) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.line.x.bottom = element_line(),
+        axis.line.y.left = element_line(),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        text = element_text(size=17),
+        aspect.ratio = 1) +
+  annotate("label", x = 10, y=3, label = expression("R"^2 ~ " = " ~ 0.12), size=6) # need to add manually R2
+
+
+ggsave(paste0(filename, "_corr.pdf"),  width = 6, height = 6)
+
+# Classify based on quantiles
+tissue_counts$atac_quantile <- with( tissue_counts, factor(
+                          findInterval( counts.x, c(-Inf,
+                             quantile(counts.x, probs=c(.3, .7)), Inf)), 
+                          labels=c("LA","None","HA")))
+
+tissue_counts$rna_quantile <- with( tissue_counts, factor(
+                          findInterval( counts.y, c(-Inf,
+                             quantile(counts.y, probs=c(.3, .7)), Inf)), 
+                          labels=c("LE","None","HE")))
+
+# Create labels for data
+library(dplyr)
+tissue_counts_annotated <-  tissue_counts %>% mutate(Groups = group_indices(., atac_quantile, rna_quantile))
+tissue_counts_annotated$Groups[tissue_counts_annotated$Groups == 1] <- "LA-LE"
+tissue_counts_annotated$Groups[tissue_counts_annotated$Groups == 2 | tissue_counts_annotated$Groups ==  4 | tissue_counts_annotated$Groups ==  5 | tissue_counts_annotated$Groups ==  6 | tissue_counts_annotated$Groups ==  8] <- "None"
+tissue_counts_annotated$Groups[tissue_counts_annotated$Groups == 3] <- "LA-HE"
+tissue_counts_annotated$Groups[tissue_counts_annotated$Groups == 7] <- "HA-LE"
+tissue_counts_annotated$Groups[tissue_counts_annotated$Groups == 9] <- "HA-HE"
+
+# Generate colors
+color <- brewer.pal(n = 4, name = "Set2")
+
+# Plot groups
+
+x1=4
+x2=11
+y1=1.7
+y2=8
+
+ggplot(tissue_counts_annotated, aes(x=counts.x, y=counts.y, col=Groups)) + 
+  geom_point() +
+  labs(title=paste(title, " (week 24) groups"),
+       x=expression("ATAC-seq accesibility [log"[2]*"]"), y = expression("RNA-seq expression [log"[2]* "(TPM)]")) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.line.x.bottom = element_line(),
+        axis.line.y.left = element_line(),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        text = element_text(size=17), 
+        aspect.ratio = 1)  + 
+  scale_color_manual(values = c(color, "black")) +
+  annotate("label", x = x1, y=y1, label = sum(tissue_counts_annotated$Groups == "LA-LE"), colour = color[4], size=6) +
+  annotate("label", x = x1, y=y2, label = sum(tissue_counts_annotated$Groups == "LA-HE"), colour = color[3], size=6) +
+  annotate("label", x = x2, y=y1, label = sum(tissue_counts_annotated$Groups == "HA-LE"), colour = color[2], size=6) +
+  annotate("label", x = x2, y=y2, label = sum(tissue_counts_annotated$Groups == "HA-HE"), colour = color[1], size=6) 
+
+ggsave(paste0(filename, "_groups.pdf"),  width = 6, height = 6)
+
+
+## Save files (only genes)
+
+write.table(tissue_counts_annotated[tissue_counts_annotated$Groups == "LA-LE",], paste0(filename, "_LA-LE.txt"), row.names = F, quote = F, sep = "\t")
+write.table(tissue_counts_annotated[tissue_counts_annotated$Groups == "LA-HE",], paste0(filename, "_LA-HE.txt"), row.names = F, quote = F, sep = "\t")
+write.table(tissue_counts_annotated[tissue_counts_annotated$Groups == "HA-LE",], paste0(filename, "_HA-LE.txt"), row.names = F, quote = F, sep = "\t")
+write.table(tissue_counts_annotated[tissue_counts_annotated$Groups == "HA-HE",], paste0(filename, "_HA-HE.txt"), row.names = F, quote = F, sep = "\t")
+
+source("~/nfur/ATACseq/scripts/aux_functions.R")
+
+dir_name <- paste0(filename, "_GO")
+dir.create(dir_name)
+gene_files <- list.files("~/nfur/intersection_atac_rna", pattern = "txt", full.names = T)
+library(filesstrings)
+file.move(gene_files, dir_name)
+
+setwd(dir_name)
+nfugene_to_dangene(dir_name)
+  
+pantherGO(dir_name)
+
+```
+
+
+
+```{r}
+## GO PLOT
+filename <- "/home/areyes/nfur/intersection_atac_rna/HB_GO/GO/HB_HA-LE_GO.txt"
+title <- gsub("_", " ", unlist(strsplit(unlist(strsplit(filename, "/"))[8], ".txt"))[1])
+
+go_table <- read.table(filename, header = T, sep = "\t")
+go_table <- go_table[!go_table$term.label %in% c("cellular process", "UNCLASSIFIED", "biological_process"),]
+go_table$fdr <- -log10(go_table$fdr)
+
+# In case some term is too large
+new_term <- "double-strand break repair..."
+go_table$term.label <- unfactor(go_table$term.label)
+go_table$term.label[go_table$term.label %in% "double-strand break repair via homologous recombination"] <- new_term
+
+library(RColorBrewer)
+color <- brewer.pal(n = 4, name = "Set2")
+
+library(ggplot2)
+ggplot(head(go_table), aes(x=reorder(term.label, -fdr), y=fdr)) +
+  geom_col(width = 0.7, show.legend = F, fill=color[2]) +
+  coord_flip() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.line.x.bottom = element_line(),
+        axis.line.y.left = element_line(),
+        axis.title.y = element_blank(),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        text = element_text(size=17), 
+        aspect.ratio = 1) +
+  labs(title= title, y = expression("-log"[10]* "(FDR)"))
+
+ggsave(paste0(filename, ".pdf"), height = 6, width = 6)
+```
+
+
+Save common genes for HA-LE.
+
+```{r}
+fb_ha_le <- read.table("~/nfur/intersection_atac_rna/FB_GO/FB_HA-LE_genename.txt")[,1]
+mb_ha_le <- read.table("~/nfur/intersection_atac_rna/MB_GO/MB_HA-LE_genename.txt")[,1]
+hb_ha_le <- read.table("~/nfur/intersection_atac_rna/HB_GO/HB_HA-LE_genename.txt")[,1]
+
+common_ha_le <- intersect(intersect(fb_ha_le, mb_ha_le), hb_ha_le)
+write.table(common_ha_le, "~/nfur/intersection_atac_rna/common_HA-LE.txt", quote = F, row.names = F, col.names = F)
+```
+
