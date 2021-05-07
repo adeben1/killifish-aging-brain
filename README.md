@@ -1,2 +1,2 @@
 # killifish-aging-brain
-Code used for processing, analyzing and figure desing of my master thesis "Epigenomic and transcriptomic alterations during aging in killifish". 
+Código usado para el procesado, análisis y diseño de figuras de mi trabajo fin de máster "Cambios epigenómicos y transcriptómicos durante el envejecimiento en pez killi"
