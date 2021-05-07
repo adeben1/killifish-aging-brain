@@ -1,0 +1,29 @@
+RELATE ENSEMBL IDS WITH OUR ASSEMBLY
+
+1. Obtain fasta from our annotation gff and genome.fa
+
+	grep 'nfurzeri_genebuild_v1'$'\t''gene' Nfu_20150522.genes_20150922.gff3 | cut -f 9 | cut -d ';' -f1 | cut -d '=' -f2 > gene_name.gff
+	grep 'nfurzeri_genebuild_v1'$'\t''gene' Nfu_20150522.genes_20150922.gff3 | cut -f 1,4,5 > coordinates.gff
+	paste coordinates.gff gene_name.gff > gff_genes.bed
+
+	(In case we chose to keep transcripts in gff_genes.bed we'd have a line for each transcript, so then we will have to keep only the first trasncript ocurrence for each gene; run the following lane)
+	
+	cat gff_genes.bed | sort -k4,4 -u > unique_gff_genes.bed # There are 27552 genes in our assembly
+
+	bedtools getfasta -s -name -fi Nfu_20150522.softmasked_genome.fa -bed unique_gff_genes.bed > Nfu_20150522.genes_strandedness.fa
+
+2. Make database for blast
+
+	sed -i 's/::.*()//' Nfu_20150522.genes_strandedness.fa # remove coordinates in seq names 
+
+	mkdir nfur_strandedness
+	cp Nfu_20150522.genes_strandedness.fa nfur_strandedness/
+	makeblastdb -in Nfu_20150522.genes.fa -title nfur_s -dbtype nucl -out nfur_s -parse_seqids
+
+3. Run blast against our database (our assembly with Nfu_g_1_**** names) using as queries a fasta file containing ensembl ids with sequence (use human_orthologs.R) 
+
+	blastn -subject_besthit -outfmt 6 -query nfur_ensemblid_genes.fasta -db /home/ska/areyes/nfur/genome/nfur_strandedness/nfur_s -out blast_biomartcdna_ourassembly_strandedness.tab
+
+	# For each query, alignments are already sorted based on bits value, so we take the first one
+	sort -k1,1 -u blast_biomartcdna_ourassembly_strandedness.tab | cut -f1,2 > Nfu_20150522.ensemblids.tab # there are 24924 ensembl ids matching to 19182 ids from our assembly
+	
